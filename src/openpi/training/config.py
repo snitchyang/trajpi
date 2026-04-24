@@ -354,6 +354,93 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class LeRobotMshabDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    For your own dataset, you can copy this class and modify the transforms to match your dataset based on the
+    comments below.
+    """
+
+    extra_delta_transform: bool = False
+    action_sequence_keys: Sequence[str] = ("action", "tcp_pose_wrt_base",)
+    # After repack, delete these last-axis indices from ``actions`` (e.g. (-5, -4) on 13-D → 11-D). Empty = no-op.
+    # Ignored when ``traj_action`` is True (world TCP + gripper replaces the full 13-D chunk first).
+    # action_drop_indices: tuple[int, ...] = (-5, -4)
+    # If True, convert base-frame TCP + base velocities to world-frame TCP (7) + gripper (1), as in lingbot mshab.
+    traj_action: bool = False
+    traj_action_fps: float = 20.0
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform is *only* applied to the data coming from the dataset,
+        # and *not* during inference. We can use it to make inputs from the dataset look
+        # as close as possible to those coming from the inference environment (e.g. match the keys).
+        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
+        # the keys we use in our inference pipeline (defined in the inference script for libero).
+        # For your own dataset, first figure out what keys your environment passes to the policy server
+        # and then modify the mappings below so your dataset's keys get matched to those target keys.
+        # The repack transform simply remaps key names here.
+        # LeRobot v2 video datasets expose features as dotted top-level keys (see meta/info.json), e.g.
+        # observation.images.top / observation.images.wrist; frames are decoded in __getitem__, not stored in parquet.
+        # Map those to LiberoInputs keys (observation/image, observation/wrist_image). Use "actions" output
+        # so LiberoInputs copies action chunks into the training batch (it looks for key "actions").
+        repack_inputs: list[_transforms.DataTransformFn] = [
+            _transforms.RepackTransform(
+                {
+                    "observation/image": "observation.images.top",
+                    "observation/wrist_image": "observation.images.wrist",
+                    "observation/state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                    "tcp_pose_wrt_base": "tcp_pose_wrt_base",
+                }
+            ),
+        ]
+        if self.traj_action:
+            repack_inputs.append(_transforms.MshabTcpBaseToWorldActions(fps=self.traj_action_fps))
+        # elif self.action_drop_indices:
+        #     repack_inputs.append(_transforms.DropActionDimensions(indices=self.action_drop_indices))
+        repack_transform = _transforms.Group(inputs=repack_inputs)
+
+        # Same as Libero: map repacked keys into model ``image`` / ``state`` / ``actions`` layout.
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs(action_dims=8 if self.traj_action else 13)],
+        )
+
+        # One additional data transform: pi0 models are trained on delta actions (relative to the first
+        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
+        # you can uncomment the following line to convert the actions to delta actions. The only exception
+        # is for the gripper actions which are always absolute.
+        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
+        # leave the 7th action (gripper) unchanged, i.e. absolute.
+        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
+        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
+        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
+
+        # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
+        # extra delta transform.
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -761,6 +848,125 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="mshab_test",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotMshabDataConfig(
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/table_place_pick_100",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=2.5e-6,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="checkpoints/pytorch_pi05",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_mshab",
+        exp_name="openpi",
+        project_name="mshab_action",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotMshabDataConfig(
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_lerobot_tpp",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="checkpoints/pytorch_pi05",
+        num_train_steps=20_000,
+        save_interval=2500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # warmup_steps=0 且 peak_lr==decay_lr 时等价于常数学习率 1e-5（对齐参考 lr_scheduler=constant）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        ),
+        ema_decay=None,
+        # val_log_interval=5000,
+        # val_repo_id="behavior-1k/2025-challenge-demos",
+        # val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_table",
+        exp_name="openpi",
+        project_name="mshab",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotMshabDataConfig(
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_set_table_100",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="checkpoints/pytorch_pi05",
+        num_train_steps=20_000,
+        save_interval=2500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # warmup_steps=0 且 peak_lr==decay_lr 时等价于常数学习率 1e-5（对齐参考 lr_scheduler=constant）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=2e-7,
+            decay_steps=20_000,
+            decay_lr=1e-8,
+        ),
+        ema_decay=None,
+        # val_log_interval=5000,
+        # val_repo_id="behavior-1k/2025-challenge-demos",
+        # val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_mstraj",
+        exp_name="openpi",
+        project_name="mstraj",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotMshabDataConfig(
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_set_table_100",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            traj_action=True,
+            traj_action_fps=20,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="checkpoints/pytorch_pi05",
+        num_train_steps=20_000,
+        save_interval=2500,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # warmup_steps=0 且 peak_lr==decay_lr 时等价于常数学习率 1e-5（对齐参考 lr_scheduler=constant）
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=0,
+            peak_lr=1e-5,
+            decay_steps=20_000,
+            decay_lr=1e-7,
+        ),
+        ema_decay=None,
+        # val_log_interval=5000,
+        # val_repo_id="behavior-1k/2025-challenge-demos",
+        # val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
@@ -937,12 +1143,13 @@ _CONFIGS = [
         name="debug",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(pi05=True),
         save_interval=100,
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+        pytorch_weight_path="checkpoints/pytorch_pi05"
     ),
     TrainConfig(
         name="debug_restore",
@@ -964,6 +1171,7 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+        pytorch_weight_path="checkpoints/pytorch_pi05"
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

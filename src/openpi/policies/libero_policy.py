@@ -92,9 +92,13 @@ class LiberoOutputs(transforms.DataTransformFn):
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
 
+    # First N columns of model outputs to return (after padding to model action dim). Libero uses 7; mshab traj uses 8.
+    action_dims: int = 7
+
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        n = self.action_dims
+        return {"actions": np.asarray(data["actions"][:, :n])}

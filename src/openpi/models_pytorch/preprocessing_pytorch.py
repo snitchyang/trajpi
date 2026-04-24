@@ -40,11 +40,12 @@ def preprocess_observation_pytorch(
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats
         is_channels_first = image.shape[1] == 3  # Check if channels are in dimension 1
-
+        # print(f"is_channels_first: {is_channels_first}")
+        # print(f"image.shape: {image.shape}")
+        assert image.shape[1] == 3, f"image.shape: {image.shape} is not [B, 3, H, W]"
         if is_channels_first:
             # Convert [B, C, H, W] to [B, H, W, C] for processing
             image = image.permute(0, 2, 3, 1)
-
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad_torch(image, *image_resolution)
@@ -144,6 +145,7 @@ def preprocess_observation_pytorch(
         # Convert back to [B, C, H, W] format if it was originally channels-first
         if is_channels_first:
             image = image.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        # print(f"image.shape after permute: {image.shape}")
 
         out_images[key] = image
 

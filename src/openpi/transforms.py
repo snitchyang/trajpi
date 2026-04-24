@@ -7,10 +7,31 @@ import flax.traverse_util as traverse_util
 import jax
 import numpy as np
 from openpi_client import image_tools
+from scipy.spatial.transform import Rotation as _R
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
+
+import logging
+
+_log = logging.getLogger(__name__)
+_transforms_stderr_handler_installed = False
+
+
+def _ensure_transforms_stderr_logging() -> None:
+    """Make INFO logs from this module visible even when root logging was configured first (e.g. by JAX/tyro)."""
+    global _transforms_stderr_handler_installed
+    if _transforms_stderr_handler_installed:
+        return
+    _transforms_stderr_handler_installed = True
+    _log.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    _log.addHandler(handler)
+    _log.propagate = False
+
 
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
@@ -98,7 +119,10 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        data = jax.tree.map(lambda k: flat_item[k], self.structure)
+        # _ensure_transforms_stderr_logging()
+        # _log.info("actions shape: %s", data["actions"].shape)
+        return data
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,6 +221,110 @@ class SubsampleActions(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["actions"] = data["actions"][:: self.stride]
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class DropActionDimensions(DataTransformFn):
+    """Remove selected indices along the last axis of ``actions`` (supports negative indices).
+
+    Runs on the flat ``actions`` tensor/chunk after :class:`RepackTransform` (e.g. ``(T, D)``).
+    If ``indices`` is empty, this is a no-op.
+    """
+
+    indices: tuple[int, ...] = ()
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or not self.indices:
+            return data
+        actions = data["actions"]
+        dim = int(np.asarray(actions).shape[-1])
+        resolved = sorted({i if i >= 0 else dim + i for i in self.indices})
+        data["actions"] = np.delete(np.asarray(actions), resolved, axis=-1)
+        return data
+
+
+def _integrate_base_velocities_mshab(base_actions: np.ndarray, dt: float) -> np.ndarray:
+    """Integrate normalized base commands [v_forward, v_angular] to base pose (x, y, theta). Matches lingbot mshab."""
+    base_actions = np.asarray(base_actions, dtype=np.float64)
+    if base_actions.ndim == 1:
+        base_actions = base_actions.reshape(1, -1)
+    t = base_actions.shape[0]
+    poses = np.zeros((t + 1, 3), dtype=np.float64)
+    v_max, omega_max = 1.0, np.pi
+    for i in range(t):
+        v = base_actions[i, 0] * v_max
+        omega = base_actions[i, 1] * omega_max
+        x, y, th = poses[i]
+        poses[i + 1, 0] = x + v * np.cos(th) * dt
+        poses[i + 1, 1] = y + v * np.sin(th) * dt
+        poses[i + 1, 2] = th + omega * dt
+    return poses
+
+
+def _tcp_wrt_base_to_world_mshab(tcp_base: np.ndarray, base_pose_xytheta: np.ndarray) -> np.ndarray:
+    """Map 7D TCP pose in base frame to world (origin = t0 base), same as lingbot ``_tcp_wrt_base_to_world``."""
+    x, y, th = base_pose_xytheta.ravel()[:3]
+    c, s = np.cos(th), np.sin(th)
+    r_base = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+    p_base = np.array([x, y, 0], dtype=np.float64)
+    tcp_base = np.asarray(tcp_base, dtype=np.float64).ravel()
+    p_tcp = tcp_base[:3]
+    q_tcp = _R.from_quat(tcp_base[3:7])
+    p_world = r_base @ p_tcp + p_base
+    rot_world = _R.from_euler("z", th) * q_tcp
+    return np.concatenate([p_world, rot_world.as_quat()])
+
+
+@dataclasses.dataclass(frozen=True)
+class MshabTcpBaseToWorldActions(DataTransformFn):
+    """Convert mshab LeRobot actions + ``tcp_pose_wrt_base`` to world-frame TCP (7) + gripper (1).
+
+    Expects **full** 13-D actions (before :class:`DropActionDimensions`): gripper at ``[:, 7:8]``,
+    base velocities at ``[:, 11:13]``. Requires repacked key ``tcp_pose_wrt_base`` aligned with ``actions`` on time.
+    """
+
+    fps: float = 20.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "tcp_pose_wrt_base" not in data:
+            raise ValueError(
+                "MshabTcpBaseToWorldActions requires `tcp_pose_wrt_base` in the batch (repack from LeRobot column)."
+            )
+        if "actions" not in data:
+            raise ValueError("MshabTcpBaseToWorldActions requires `actions`.")
+
+        action = np.asarray(data["actions"], dtype=np.float64)
+        tcp_raw = np.asarray(data["tcp_pose_wrt_base"], dtype=np.float64)
+        if action.ndim == 1:
+            action = action.reshape(1, -1)
+        if tcp_raw.ndim == 1:
+            tcp_raw = tcp_raw.reshape(1, -1)
+
+        d = action.shape[-1]
+        if d < 13:
+            raise ValueError(
+                f"MshabTcpBaseToWorldActions expects actions with last dim >= 13 (got {d}); "
+                "apply this transform before DropActionDimensions."
+            )
+        if tcp_raw.shape[-1] != 7:
+            raise ValueError(f"tcp_pose_wrt_base must have 7 columns (got shape {tcp_raw.shape}).")
+        if tcp_raw.shape[0] != action.shape[0]:
+            raise ValueError(
+                f"tcp_pose_wrt_base length {tcp_raw.shape[0]} != actions length {action.shape[0]}; "
+                "check frame alignment."
+            )
+
+        dt = 1.0 / float(self.fps)
+        base_actions = action[:, 11:13]
+        base_poses = _integrate_base_velocities_mshab(base_actions, dt)
+        tcp_base = tcp_raw
+        tcp_world = np.zeros_like(tcp_base)
+        for i in range(action.shape[0]):
+            tcp_world[i] = _tcp_wrt_base_to_world_mshab(tcp_base[i], base_poses[i])
+        gripper = action[:, 7:8]
+        data["actions"] = np.concatenate([tcp_world, gripper], axis=-1).astype(np.float32)
+        del data["tcp_pose_wrt_base"]
         return data
 
 
