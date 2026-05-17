@@ -1,0 +1,17 @@
+# Conda base for openpi (Physical Intelligence). Mirrors uv/pyproject stack via pip.
+# Usage:
+#   bash scripts/install_conda.sh
+# Or manually:
+#   conda env create -f environment.yml
+#   conda activate openpi
+#   bash scripts/install_conda.sh --skip-create   # only pip phase
+
+name: openpi
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  # Common native deps for video / wheels; adjust if your cluster uses modules instead
+  - ffmpeg

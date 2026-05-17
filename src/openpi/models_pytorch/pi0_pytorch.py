@@ -99,6 +99,10 @@ class PI0Pytorch(nn.Module):
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
+        self.traj2actions = getattr(config, "traj2actions", False)
+        if self.traj2actions:
+            self.traj_in_proj = nn.Linear(config.traj_dim, action_expert_config.width)
+            self.traj_out_proj = nn.Linear(action_expert_config.width, config.traj_dim)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -235,8 +239,12 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, state, noisy_actions, timestep, noisy_traj: Tensor | None = None):
+        """Embed state, noisy trajectory / actions, timestep for the action expert.
+
+        When ``noisy_traj`` is set (``traj2actions``), ``noisy_actions`` is ``(B, H, action_dim)`` and
+        ``noisy_traj`` is ``(B, H, traj_dim)``; they are projected and concatenated along time.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -267,11 +275,24 @@ class PI0Pytorch(nn.Module):
         )
         time_emb = time_emb.type(dtype=timestep.dtype)
 
-        # Fuse timestep + action information using an MLP
-        def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
+        # Project trajectory and/or actions into expert width, then fuse timestep (Pi0) or adaRMS (Pi05).
+        if noisy_traj is not None:
 
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+            def traj_proj_func(noisy_traj):
+                return self.traj_in_proj(noisy_traj)
+
+            def action_proj_func(noisy_actions):
+                return self.action_in_proj(noisy_actions)
+
+            traj_emb = self._apply_checkpoint(traj_proj_func, noisy_traj)
+            act_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+            action_emb = torch.cat([traj_emb, act_emb], dim=1)
+        else:
+
+            def action_proj_func(noisy_actions):
+                return self.action_in_proj(noisy_actions)
+
+            action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
             time_emb = time_emb[:, None, :].expand_as(action_emb)
@@ -304,8 +325,15 @@ class PI0Pytorch(nn.Module):
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+        # Set attention masks so that image, language and state inputs do not attend to suffix tokens.
+        # Traj block then action block: traj tokens do not attend to actions; actions attend to traj.
+        h = self.config.action_horizon
+        if noisy_traj is not None:
+            block = [1] + ([0] * (h - 1))
+            att_masks += block + block
+        else:
+            n = noisy_actions.shape[1]
+            att_masks += [1] + ([0] * (n - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -314,22 +342,57 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def forward(self, observation, actions, noise=None, time=None, traj=None) -> tuple[Tensor, Tensor | None, Tensor]:
+        """Training forward: per-element MSE, then (traj_mean, action_mean) means for logging when traj2actions."""
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+        h = self.config.action_horizon
+        td, ad = self.config.traj_dim, self.config.action_dim
+        bsize, device = actions.shape[0], actions.device
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
+            time = self.sample_time(bsize, device)
         time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+
+        if self.traj2actions:
+            if noise is None:
+                noise_traj = self.sample_noise((bsize, h, td), device)
+                noise_act = self.sample_noise((bsize, h, ad), device)
+            elif isinstance(noise, tuple) and len(noise) == 2:
+                noise_traj, noise_act = noise
+            elif (
+                isinstance(noise, Tensor)
+                and noise.ndim == 3
+                and noise.shape[1] == 2 * h
+                and noise.shape[2] == ad == td
+            ):
+                noise_traj, noise_act = noise[:, :h].contiguous(), noise[:, h:].contiguous()
+            else:
+                raise ValueError(
+                    "traj2actions: pass noise=None, noise=(noise_traj, noise_act), or one "
+                    "(B, 2*action_horizon, D) tensor when action_dim == traj_dim == D."
+                )
+
+            x0_traj = traj if traj is not None else noise_traj
+            x0_act = actions
+            x_t_traj = time_expanded * noise_traj + (1 - time_expanded) * x0_traj
+            x_t_act = time_expanded * noise_act + (1 - time_expanded) * x0_act
+            u_t_traj = noise_traj - x0_traj
+            u_t_act = noise_act - x0_act
+        else:
+            if noise is None:
+                noise = self.sample_noise(actions.shape, actions.device)
+            x0 = actions
+            x_t = time_expanded * noise + (1 - time_expanded) * x0
+            u_t = noise - x0
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        if self.traj2actions:
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                state, x_t_act, time, noisy_traj=x_t_traj
+            )
+        else:
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -362,24 +425,58 @@ class PI0Pytorch(nn.Module):
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suff_n = 2 * h if self.traj2actions else h
+        suffix_out = suffix_out[:, -suff_n:]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
+        def out_proj_func(suffix_out):
+            if self.traj2actions:
+                return self.traj_out_proj(suffix_out[:, :h]), self.action_out_proj(suffix_out[:, h:])
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = self._apply_checkpoint(out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        if self.traj2actions:
+            v_t_traj, v_t_act = v_t
+            loss_traj = F.mse_loss(u_t_traj, v_t_traj, reduction="none")
+            loss_act = F.mse_loss(u_t_act, v_t_act, reduction="none")
+            losses = torch.cat([loss_traj.flatten(1), loss_act.flatten(1)], dim=1)
+            return losses, loss_traj.mean(), loss_act.mean()
+
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        return losses, None, losses.mean()
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
-        if noise is None:
-            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
-            noise = self.sample_noise(actions_shape, device)
+        h = self.config.action_horizon
+        td, ad = self.config.traj_dim, self.config.action_dim
+        if self.traj2actions:
+            if noise is None:
+                x_t = (
+                    self.sample_noise((bsize, h, td), device),
+                    self.sample_noise((bsize, h, ad), device),
+                )
+            elif isinstance(noise, tuple) and len(noise) == 2:
+                x_t = noise
+            elif (
+                isinstance(noise, Tensor)
+                and noise.ndim == 3
+                and noise.shape[1] == 2 * h
+                and noise.shape[2] == ad == td
+            ):
+                x_t = (noise[:, :h].contiguous(), noise[:, h:].contiguous())
+            else:
+                raise ValueError(
+                    "traj2actions: pass noise=None, noise=(noise_traj, noise_act), or one "
+                    "(B, 2*action_horizon, D) tensor when action_dim == traj_dim == D."
+                )
+        else:
+            if noise is None:
+                x_t = self.sample_noise((bsize, h, ad), device)
+            else:
+                x_t = noise
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
@@ -402,7 +499,6 @@ class PI0Pytorch(nn.Module):
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
-        x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
@@ -414,9 +510,15 @@ class PI0Pytorch(nn.Module):
                 expanded_time,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t + dt * v_t
+            if self.traj2actions:
+                v_traj, v_act = v_t
+                x_traj, x_act = x_t
+                x_t = (x_traj + dt * v_traj, x_act + dt * v_act)
+            else:
+                x_t = x_t + dt * v_t
             time += dt
+        if self.traj2actions:
+            return x_t[0], x_t[1]
         return x_t
 
     def denoise_step(
@@ -427,8 +529,14 @@ class PI0Pytorch(nn.Module):
         x_t,
         timestep,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        """Apply one denoising step of the noise ``x_t`` (or ``(x_traj, x_act)`` when traj2actions)."""
+        if self.traj2actions:
+            x_traj, x_act = x_t
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                state, x_act, timestep, noisy_traj=x_traj
+            )
+        else:
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -457,6 +565,10 @@ class PI0Pytorch(nn.Module):
         )
 
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        h = self.config.action_horizon
+        suff_n = 2 * h if self.traj2actions else h
+        suffix_out = suffix_out[:, -suff_n:]
         suffix_out = suffix_out.to(dtype=torch.float32)
+        if self.traj2actions:
+            return self.traj_out_proj(suffix_out[:, :h]), self.action_out_proj(suffix_out[:, h:])
         return self.action_out_proj(suffix_out)

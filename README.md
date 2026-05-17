@@ -51,6 +51,16 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
+**Conda (alternative to uv)**: If `uv` locks or NFS home directories cause issues, use the conda recipe at the repo root:
+
+```bash
+bash scripts/install_conda.sh
+# Optional: dev tools / RLDS extras
+# bash scripts/install_conda.sh --with-dev --with-rlds
+```
+
+This creates env `openpi` from `environment.yml`, then installs `packages/openpi-client`, `requirements-conda.txt`, and the root package with `pip -e`. Same pins and git revisions as `pyproject.toml` / `tool.uv`.
+
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
 

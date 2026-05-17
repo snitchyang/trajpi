@@ -166,7 +166,8 @@ class Normalize(DataTransformFn):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        normalized_x = (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        return normalized_x
 
 
 @dataclasses.dataclass(frozen=True)
@@ -285,7 +286,7 @@ class MshabTcpBaseToWorldActions(DataTransformFn):
     """
 
     fps: float = 20.0
-
+    require_gripper: bool = True
     def __call__(self, data: DataDict) -> DataDict:
         if "tcp_pose_wrt_base" not in data:
             raise ValueError(
@@ -323,7 +324,10 @@ class MshabTcpBaseToWorldActions(DataTransformFn):
         for i in range(action.shape[0]):
             tcp_world[i] = _tcp_wrt_base_to_world_mshab(tcp_base[i], base_poses[i])
         gripper = action[:, 7:8]
-        data["actions"] = np.concatenate([tcp_world, gripper], axis=-1).astype(np.float32)
+        if self.require_gripper:
+            data["traj"] = np.concatenate([tcp_world, gripper], axis=-1).astype(np.float32)
+        else:
+            data["traj"] = tcp_world.astype(np.float32)
         del data["tcp_pose_wrt_base"]
         return data
 
@@ -367,6 +371,114 @@ class AbsoluteActions(DataTransformFn):
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        data["actions"] = actions
+
+        return data
+
+
+def _broadcast_state_values_for_actions(state_values: np.ndarray, action_values: np.ndarray) -> np.ndarray:
+    """Broadcast per-observation state values across an optional action horizon."""
+    while state_values.ndim < action_values.ndim:
+        state_values = np.expand_dims(state_values, axis=-2)
+    return state_values
+
+
+@dataclasses.dataclass(frozen=True)
+class DeltaMSActions(DataTransformFn):
+    """Convert MSHAB absolute arm actions into deltas using Fetch qpos order.
+
+    MSHAB Fetch actions are laid out as [arm7, gripper1, body3, base2], while
+    MSHAB observations drop the base qpos and keep [torso1, head2, arm7, gripper2].
+    Therefore action columns 0:7 correspond to state/qpos columns 3:10.
+    """
+
+    action_indices: Sequence[int] = tuple(range(7))
+    state_indices: Sequence[int] = tuple(range(3, 10))
+
+    def __post_init__(self):
+        if len(self.action_indices) != len(self.state_indices):
+            raise ValueError("action_indices and state_indices must have the same length.")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data:
+            return data
+
+        state_key = "state" if "state" in data else "observation/state"
+        if state_key not in data:
+            raise ValueError("DeltaMSActions requires `state` or `observation/state` in the batch.")
+
+        state = np.asarray(data[state_key])
+        actions = data["actions"]
+        action_indices = np.asarray(self.action_indices)
+        state_indices = np.asarray(self.state_indices)
+        if actions.shape[-1] <= int(action_indices.max()):
+            raise ValueError(f"DeltaMSActions action dim {actions.shape[-1]} is too small for {self.action_indices}.")
+        if state.shape[-1] <= int(state_indices.max()):
+            raise ValueError(f"DeltaMSActions state dim {state.shape[-1]} is too small for {self.state_indices}.")
+
+        action_values = actions[..., action_indices]
+        state_values = _broadcast_state_values_for_actions(state[..., state_indices], action_values)
+        actions[..., action_indices] = action_values - state_values
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class AbsoluteMSActions(DataTransformFn):
+    """Convert MSHAB delta arm actions back to absolute values using Fetch qpos order."""
+
+    action_indices: Sequence[int] = tuple(range(7))
+    state_indices: Sequence[int] = tuple(range(3, 10))
+
+    def __post_init__(self):
+        if len(self.action_indices) != len(self.state_indices):
+            raise ValueError("action_indices and state_indices must have the same length.")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data:
+            return data
+
+        state_key = "state" if "state" in data else "observation/state"
+        if state_key not in data:
+            raise ValueError("AbsoluteMSActions requires `state` or `observation/state` in the batch.")
+
+        state = np.asarray(data[state_key])
+        actions = data["actions"]
+        action_indices = np.asarray(self.action_indices)
+        state_indices = np.asarray(self.state_indices)
+        if actions.shape[-1] <= int(action_indices.max()):
+            raise ValueError(f"AbsoluteMSActions action dim {actions.shape[-1]} is too small for {self.action_indices}.")
+        if state.shape[-1] <= int(state_indices.max()):
+            raise ValueError(f"AbsoluteMSActions state dim {state.shape[-1]} is too small for {self.state_indices}.")
+
+        action_values = actions[..., action_indices]
+        state_values = _broadcast_state_values_for_actions(state[..., state_indices], action_values)
+        actions[..., action_indices] = action_values + state_values
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class MappedAbsoluteActions(DataTransformFn):
+    """Repacks selected delta actions into absolute action space with explicit state-action mapping."""
+
+    # Action indices to convert from delta to absolute.
+    action_indices: Sequence[int]
+    # State indices to add to the corresponding action indices.
+    state_indices: Sequence[int]
+
+    def __post_init__(self):
+        if len(self.action_indices) != len(self.state_indices):
+            raise ValueError("action_indices and state_indices must have the same length.")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data:
+            return data
+
+        state, actions = data["observation/state"], data["actions"]
+        action_indices = np.asarray(self.action_indices)
+        state_indices = np.asarray(self.state_indices)
+        actions[..., action_indices] += np.expand_dims(state[..., state_indices], axis=-2)
         data["actions"] = actions
 
         return data

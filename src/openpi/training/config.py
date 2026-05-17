@@ -371,6 +371,9 @@ class LeRobotMshabDataConfig(DataConfigFactory):
     traj_action: bool = False
     traj_action_fps: float = 20.0
 
+    train_traj: bool = False
+    use_absolute_actions: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # The repack transform is *only* applied to the data coming from the dataset,
@@ -397,8 +400,28 @@ class LeRobotMshabDataConfig(DataConfigFactory):
                 }
             ),
         ]
+        if self.train_traj:
+            repack_inputs = [
+                _transforms.RepackTransform(
+                    {
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "tcp_pose_wrt_base": "tcp_pose_wrt_base",
+                    }
+                ),
+                # MSHAB action layout is [arm7, gripper1, body3, base2]; trajectory training drops gripper.
+                _transforms.MshabTcpBaseToWorldActions(fps=self.traj_action_fps, require_gripper=False),
+                _transforms.DropActionDimensions(indices=(7,)),
+            ]
         if self.traj_action:
             repack_inputs.append(_transforms.MshabTcpBaseToWorldActions(fps=self.traj_action_fps))
+        if self.use_absolute_actions:
+            repack_inputs.append(
+                _transforms.MappedAbsoluteActions(
+                    action_indices=tuple(range(7)) + tuple(range(8, 11)),
+                    state_indices=tuple(range(7)) + tuple(range(9, 12)),
+                )
+            )
         # elif self.action_drop_indices:
         #     repack_inputs.append(_transforms.DropActionDimensions(indices=self.action_drop_indices))
         repack_transform = _transforms.Group(inputs=repack_inputs)
@@ -406,7 +429,7 @@ class LeRobotMshabDataConfig(DataConfigFactory):
         # Same as Libero: map repacked keys into model ``image`` / ``state`` / ``actions`` layout.
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
-            outputs=[libero_policy.LiberoOutputs(action_dims=8 if self.traj_action else 13)],
+            outputs=[libero_policy.LiberoOutputs(action_dims=13)],
         )
 
         # One additional data transform: pi0 models are trained on delta actions (relative to the first
@@ -875,7 +898,7 @@ _CONFIGS = [
         project_name="mshab_action",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"),
         data=LeRobotMshabDataConfig(
-            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_lerobot_tpp",
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_lerobot_open_close",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -902,14 +925,24 @@ _CONFIGS = [
         num_workers=16,
     ),
     TrainConfig(
-        name="pi05_table",
+        name="pi05_mstraj",
         exp_name="openpi",
-        project_name="mshab",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"),
+        project_name="mstraj",
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_horizon=32, 
+            paligemma_variant="gemma_2b_lora", 
+            traj2actions=True, 
+            enable_action_traj_alignment=True,
+            action_traj_alignment_predictor_ckpt_path="outputs/trajectory_predictor/20260503_000019/model_35.pt"
+        ),
         data=LeRobotMshabDataConfig(
-            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_set_table_100",
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_lerobot_tpp",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
+            traj_action=True,
+            traj_action_fps=20,
+            use_absolute_actions=False,
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="checkpoints/pytorch_pi05",
@@ -921,9 +954,9 @@ _CONFIGS = [
         # warmup_steps=0 且 peak_lr==decay_lr 时等价于常数学习率 1e-5（对齐参考 lr_scheduler=constant）
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=0,
-            peak_lr=2e-7,
-            decay_steps=20_000,
-            decay_lr=1e-8,
+            peak_lr=1e-4,
+            decay_steps=30_000,
+            decay_lr=1e-6,
         ),
         ema_decay=None,
         # val_log_interval=5000,
@@ -931,38 +964,34 @@ _CONFIGS = [
         # val_episodes_index=list(range(190, 200)),
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=16,
+        num_workers=2,
     ),
     TrainConfig(
-        name="pi05_mstraj",
-        exp_name="openpi",
-        project_name="mstraj",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"),
+        name="traj_decoder",
+        exp_name="traj_decoder",
+        project_name="traj_decoder",
         data=LeRobotMshabDataConfig(
-            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_set_table_100",
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_lerobot",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
-            traj_action=True,
+            train_traj=True,
             traj_action_fps=20,
         ),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="checkpoints/pytorch_pi05",
-        num_train_steps=20_000,
-        save_interval=2500,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora"
-        ).get_freeze_filter(),
-        # warmup_steps=0 且 peak_lr==decay_lr 时等价于常数学习率 1e-5（对齐参考 lr_scheduler=constant）
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=0,
-            peak_lr=1e-5,
-            decay_steps=20_000,
-            decay_lr=1e-7,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+    ),
+        TrainConfig(
+        name="traj_predictor",
+        exp_name="traj_predictor",
+        project_name="traj_predictor",
+        data=LeRobotMshabDataConfig(
+            repo_id="/data/user/wzhang834/users/vick/datasets/mshab/mshab_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            train_traj=True,
+            traj_action_fps=20,
         ),
-        ema_decay=None,
-        # val_log_interval=5000,
-        # val_repo_id="behavior-1k/2025-challenge-demos",
-        # val_episodes_index=list(range(190, 200)),
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=16,

@@ -24,15 +24,29 @@ class Pi0Config(_model.BaseModelConfig):
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
+    traj_dim: int = 8
     max_token_len: int = None  # type: ignore
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # When True, the PyTorch Pi0 expert models trajectory then actions: suffix length is 2 * action_horizon
+    # (traj tokens first, each traj step is traj_dim; actions use action_dim). JAX Pi0 ignores this flag.
+    traj2actions: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
-    pytorch_compile_mode: str | None = "max-autotune"
+    pytorch_compile_mode: str | None = "default"
+    # Optional test-time action refinement to align action -> trajectory_predictor(action) with model trajectory output.
+    enable_action_traj_alignment: bool = False
+    action_traj_alignment_predictor_ckpt_path: str | None = None
+    action_traj_alignment_model_config_json: str | None = None
+    action_traj_alignment_num_steps: int = 8
+    action_traj_alignment_lr: float = 1
+    # If None, use traj_target_offset from predictor checkpoint config.
+    action_traj_alignment_traj_target_offset: int | None = None
+    # MSHAB uses index 7 for gripper in 13-d action. Set None to disable dropping.
+    action_traj_alignment_gripper_index_to_drop: int | None = 7
 
     def __post_init__(self):
         if self.max_token_len is None:

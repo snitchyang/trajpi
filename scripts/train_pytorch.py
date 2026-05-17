@@ -221,7 +221,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device), strict=False)
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -363,8 +363,9 @@ def train_loop(config: _config.TrainConfig):
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
+        # Loader yields (observation, actions) or (observation, traj, actions) when batch includes traj.
+        observation = sample_batch[0]
+        actions = sample_batch[-1]
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
@@ -400,6 +401,8 @@ def train_loop(config: _config.TrainConfig):
             paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
+            traj_dim=getattr(config.model, "traj_dim", 8),
+            traj2actions=getattr(config.model, "traj2actions", False),
         )
     else:
         model_cfg = config.model
@@ -444,7 +447,7 @@ def train_loop(config: _config.TrainConfig):
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path, strict=False
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
@@ -511,26 +514,31 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for batch in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
+            # Unified loader: (observation, actions) or (observation, traj, actions) when traj is present.
+            if len(batch) == 3:
+                observation, traj, actions = batch
+            else:
+                observation, actions = batch
+                traj = None
+
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
+            if traj is not None:
+                traj = traj.to(torch.float32).to(device)  # noqa: PLW2901
 
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
+            # Forward pass: (per_el_loss, traj_mean|None, action_mean)
+            losses, trajectory_loss, action_loss = model(observation, actions, traj=traj)
+            if not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
             loss = losses.mean()
@@ -557,13 +565,15 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                step_info = {
+                    "loss": loss.item(),
+                    "action_loss": action_loss.item() if isinstance(action_loss, torch.Tensor) else float(action_loss),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                if trajectory_loss is not None:
+                    step_info["trajectory_loss"] = trajectory_loss.item()
+                infos.append(step_info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
@@ -579,22 +589,35 @@ def train_loop(config: _config.TrainConfig):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+                avg_action_loss = sum(info["action_loss"] for info in infos) / len(infos)
+                avg_traj_loss = None
+                if infos and "trajectory_loss" in infos[0]:
+                    avg_traj_loss = sum(info["trajectory_loss"] for info in infos) / len(infos)
+                log_parts = [
+                    f"step={global_step}",
+                    f"loss={avg_loss:.4f}",
+                    f"action_loss={avg_action_loss:.4f}",
+                ]
+                if avg_traj_loss is not None:
+                    log_parts.append(f"trajectory_loss={avg_traj_loss:.4f}")
+                log_parts += [f"lr={avg_lr:.2e}", f"time={elapsed:.1f}s"]
+                if avg_grad_norm is not None:
+                    log_parts.insert(-1, f"grad_norm={avg_grad_norm:.2f}")
+                logging.info(" ".join(log_parts))
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
+                        "action_loss": avg_action_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    if avg_traj_loss is not None:
+                        log_payload["trajectory_loss"] = avg_traj_loss
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

@@ -3,6 +3,11 @@ assets/
 checkpoints/
 data/
 wandb/
+log_*.*
+outputs
+config_to_change.txt
+*.mp4
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

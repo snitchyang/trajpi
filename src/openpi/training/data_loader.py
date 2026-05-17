@@ -537,4 +537,7 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if "traj" in batch:
+                yield _model.Observation.from_dict(batch), batch["traj"], batch["actions"]
+            else:
+                yield _model.Observation.from_dict(batch), batch["actions"]

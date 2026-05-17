@@ -74,6 +74,9 @@ class LiberoInputs(transforms.DataTransformFn):
         if "actions" in data:
             inputs["actions"] = data["actions"]
 
+        if "traj" in data:
+            inputs["traj"] = data["traj"]
+
         # Pass the prompt (aka language instruction) to the model.
         # Keep this for your own dataset (but modify the key if the instruction is not
         # stored in "prompt"; the output dict always needs to have the key "prompt").
@@ -101,4 +104,7 @@ class LiberoOutputs(transforms.DataTransformFn):
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
         n = self.action_dims
-        return {"actions": np.asarray(data["actions"][:, :n])}
+        outputs = {"actions": np.asarray(data["actions"][:, :n])}
+        if data.get("traj") is not None:
+            outputs["traj"] = np.asarray(data["traj"])
+        return outputs

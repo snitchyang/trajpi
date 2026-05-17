@@ -79,8 +79,12 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
+        config = _config.get_config(checkpoint.config)
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            config,
+            checkpoint.dir,
+            default_prompt=default_prompt,
+            sample_trajectory=getattr(config.model, "traj2actions", False),
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -89,8 +93,12 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            config = _config.get_config(args.policy.config)
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                config,
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                sample_trajectory=getattr(config.model, "traj2actions", False),
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
