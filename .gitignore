@@ -1,4 +1,7 @@
 # Data directories.
+# Machine-local symlinks (never commit).
+/datasets
+/mshab
 assets/
 checkpoints/
 data/
